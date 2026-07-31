@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LeadRyze Widget — Local Test Page</title>
+</head>
+<body style="font-family: -apple-system, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222;">
+  <h1>This is a pretend "client website"</h1>
+  <p>
+    It has nothing to do with LeadRyze itself — it's just a plain HTML page standing
+    in for the kind of external site a tenant would actually embed the widget on.
+    If everything is wired up correctly, a chat bubble should appear in the
+    bottom-right corner a moment after this page loads.
+  </p>
+  <p>
+    <strong>Before this will work:</strong> in LeadRyze → Configuration Hub → AI
+    Chatbot Widget, add <code>localhost</code> as an Allowed Domain and save —
+    a locally-served test page like this one sends <code>Origin: http://localhost:&lt;port&gt;</code>,
+    and the widget's own CORS check matches on hostname only (ignores the port).
+  </p>
+
+  <!--
+    Paste your REAL embed snippet from the widget settings page here,
+    replacing the line below (it already has the right src — just swap the
+    data-widget-key value for the one shown on your own settings page).
+  -->
+  <script src="http://localhost:5000/widget/loader.js" data-widget-key="wgt_3bf34fed29e37519e47f267cdd0c268b" async></script>
+</body>
+</html>

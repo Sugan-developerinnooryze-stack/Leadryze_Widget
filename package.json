@@ -1,0 +1,17 @@
+{
+  "name": "leadryze-widget",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LeadRyze Chat Widget — an embeddable AI sales agent any tenant installs on their own public website with one <script> tag.",
+  "scripts": {
+    "build": "node build.js",
+    "dev": "node build.js --watch",
+    "type-check": "tsc --noEmit",
+    "test-page": "node test/serve.js"
+  },
+  "devDependencies": {
+    "dotenv": "^16.4.5",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.4"
+  }
+}
