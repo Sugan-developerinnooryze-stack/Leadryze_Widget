@@ -4,6 +4,7 @@ export interface WidgetConfig {
   logoUrl?: string;
   primaryColor: string;
   greeting: string;
+  template?: 'modern' | 'minimal' | 'chips' | 'dark';
 }
 
 function escapeHtml(s: string): string {
@@ -30,6 +31,11 @@ const ICON_CHAT = '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" s
 const ICON_CLOSE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
 const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>';
 
+// A small, generic set of quick-reply suggestions for the "chips" template —
+// deliberately business-type-agnostic (no industry-specific wording), since
+// this same bundle serves every tenant regardless of what they sell.
+const CHIP_SUGGESTIONS = ['Book an appointment', 'I have a question', 'Talk to a human'];
+
 /** Renders inside a Shadow DOM (`mode:'open'`) so the tenant's own site CSS
  * can never leak into the widget or vice versa — this matters here
  * specifically because, unlike a scraping-only content script, this widget
@@ -42,8 +48,11 @@ export class WidgetUI {
   private panelEl: HTMLElement;
   private bubbleEl: HTMLElement;
   private open = false;
+  private onSend: (message: string) => void;
+  private typingEl: HTMLElement | null = null;
 
   constructor(config: WidgetConfig, onSend: (message: string) => void) {
+    this.onSend = onSend;
     const host = document.createElement('div');
     host.id = 'leadryze-widget-host';
     // `all: initial` isolates this host element's own box from the host
@@ -63,20 +72,44 @@ export class WidgetUI {
 
     this.bubbleEl.addEventListener('click', () => this.toggle());
     closeEl.addEventListener('click', () => this.toggle());
-    this.sendBtn.addEventListener('click', () => this.handleSend(onSend));
+    this.sendBtn.addEventListener('click', () => this.handleSend());
     this.inputEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') this.handleSend(onSend);
+      if (e.key === 'Enter') this.handleSend();
     });
 
     if (config.greeting) this.addMessage('assistant', config.greeting);
+
+    if ((config.template ?? 'modern') === 'chips') this.renderChipSuggestions();
   }
 
-  private handleSend(onSend: (message: string) => void): void {
+  private renderChipSuggestions(): void {
+    const wrap = document.createElement('div');
+    wrap.className = 'lr-chips';
+    for (const label of CHIP_SUGGESTIONS) {
+      const btn = document.createElement('button');
+      btn.className = 'lr-chip';
+      btn.type = 'button';
+      btn.textContent = label;
+      btn.addEventListener('click', () => {
+        wrap.remove();
+        this.sendText(label);
+      });
+      wrap.appendChild(btn);
+    }
+    this.messagesEl.appendChild(wrap);
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+
+  private handleSend(): void {
     const text = this.inputEl.value.trim();
     if (!text) return;
     this.inputEl.value = '';
+    this.sendText(text);
+  }
+
+  private sendText(text: string): void {
     this.addMessage('user', text);
-    onSend(text);
+    this.onSend(text);
   }
 
   toggle(): void {
@@ -106,8 +139,6 @@ export class WidgetUI {
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
 
-  private typingEl: HTMLElement | null = null;
-
   setBusy(busy: boolean): void {
     this.sendBtn.disabled = busy;
     this.inputEl.disabled = busy;
@@ -127,6 +158,7 @@ export class WidgetUI {
   private renderShell(config: WidgetConfig): string {
     const color = config.primaryColor || '#2563eb';
     const colorDark = shade(color, -0.18);
+    const template = config.template ?? 'modern';
     const avatar = config.logoUrl
       ? `<img src="${escapeHtml(config.logoUrl)}" alt="" id="lr-avatar-img" />`
       : `<span id="lr-avatar-fallback">${escapeHtml((config.agentName || config.companyName || '?').charAt(0).toUpperCase())}</span>`;
@@ -140,10 +172,11 @@ export class WidgetUI {
   @keyframes lr-fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
+  /* ── Base structure shared by every template — only look-and-feel differs ── */
   #lr-bubble {
     position: fixed; right: 22px; bottom: 22px; width: 60px; height: 60px; border-radius: 50%;
     border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 10px 24px -6px ${color}66, 0 2px 8px rgba(0,0,0,0.15);
+    background: ${color}; box-shadow: 0 10px 24px -6px ${color}66, 0 2px 8px rgba(0,0,0,0.15);
     transition: transform .15s ease, box-shadow .15s ease;
   }
   #lr-bubble:hover { transform: scale(1.06); box-shadow: 0 14px 28px -6px ${color}80, 0 2px 8px rgba(0,0,0,0.18); }
@@ -188,6 +221,11 @@ export class WidgetUI {
   .lr-typing span:nth-child(2) { animation-delay: .15s; }
   .lr-typing span:nth-child(3) { animation-delay: .3s; }
 
+  .lr-chips { display: flex; flex-wrap: wrap; gap: 6px; animation: lr-fade-in .2s ease; }
+  .lr-chip { border: 1.5px solid ${color}; background: #fff; color: ${color}; font-size: 12.5px; font-weight: 600;
+    padding: 7px 12px; border-radius: 999px; cursor: pointer; transition: background .15s ease, color .15s ease; }
+  .lr-chip:hover { background: ${color}; color: #fff; }
+
   #lr-inputbar { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #edeef2; background: #fff; flex-shrink: 0; }
   #lr-input { flex: 1; padding: 9px 13px; border: 1px solid #dfe2e8; border-radius: 22px; font-size: 13.5px;
     outline: none; transition: border-color .15s ease; }
@@ -196,9 +234,35 @@ export class WidgetUI {
     cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform .1s ease, opacity .15s ease; }
   #lr-send:hover:not(:disabled) { transform: scale(1.06); }
   #lr-send:disabled, #lr-input:disabled { opacity: .55; cursor: default; }
+
+  /* ── Minimal Flat — understated, low-key, no heavy shadows/gradients ── */
+  #lr-panel[data-template="minimal"] { border-radius: 8px; box-shadow: 0 2px 16px rgba(15,23,42,0.14); }
+  #lr-panel[data-template="minimal"] #lr-header { background: ${color}; }
+  #lr-panel[data-template="minimal"] #lr-avatar { display: none; }
+  #lr-bubble[data-template="minimal"] { border-radius: 14px; box-shadow: 0 3px 10px rgba(0,0,0,0.16); }
+  #lr-panel[data-template="minimal"] .lr-msg { border-radius: 8px; }
+  #lr-panel[data-template="minimal"] .lr-msg-assistant { box-shadow: none; }
+  #lr-panel[data-template="minimal"] #lr-input { border-radius: 8px; }
+  #lr-panel[data-template="minimal"] #lr-send { border-radius: 8px; }
+
+  /* ── Compact Chips — flat header, icon avatar, quick-reply suggestions ── */
+  #lr-panel[data-template="chips"] #lr-header { background: ${color}; }
+  #lr-panel[data-template="chips"] #lr-avatar { background: #fff; color: ${color}; }
+  #lr-panel[data-template="chips"] .lr-msg { border-radius: 12px; }
+  #lr-panel[data-template="chips"] .lr-msg-assistant { border-radius: 4px 12px 12px 12px; }
+  #lr-panel[data-template="chips"] .lr-msg-user { border-radius: 12px 4px 12px 12px; }
+
+  /* ── Dark Professional — dark chrome, light readable message area ── */
+  #lr-panel[data-template="dark"] { background: #f4f5f7; }
+  #lr-panel[data-template="dark"] #lr-header { background: #1a1f2e; }
+  #lr-panel[data-template="dark"] #lr-avatar { background: rgba(255,255,255,0.1); }
+  #lr-panel[data-template="dark"] #lr-close { background: rgba(255,255,255,0.08); }
+  #lr-panel[data-template="dark"] #lr-close:hover { background: rgba(255,255,255,0.16); }
+  #lr-panel[data-template="dark"] #lr-messages { background: #f4f5f7; }
+  #lr-panel[data-template="dark"] #lr-inputbar { background: #fff; border-top-color: #e4e6ea; }
 </style>
-<button id="lr-bubble" aria-label="Open chat" style="background:${color}">${ICON_CHAT}</button>
-<div id="lr-panel">
+<button id="lr-bubble" data-template="${template}" aria-label="Open chat">${ICON_CHAT}</button>
+<div id="lr-panel" data-template="${template}">
   <div id="lr-header">
     <div id="lr-avatar">${avatar}</div>
     <div id="lr-header-text">
