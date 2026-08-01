@@ -126,6 +126,7 @@ export class WidgetUI {
     this.panelEl.classList.toggle('lr-open', this.open);
     if (this.open) {
       this.panelEl.style.display = 'flex';
+      this.shadow.getElementById('lr-badge')?.remove();
       requestAnimationFrame(() => this.inputEl.focus());
     } else {
       // Let the closing transition finish before actually hiding, so the
@@ -188,6 +189,8 @@ export class WidgetUI {
     background: ${color}; box-shadow: 0 10px 24px -6px ${color}66, 0 2px 8px rgba(0,0,0,0.15);
     transition: transform .15s ease, box-shadow .15s ease;
   }
+  #lr-bubble-wrap { position: fixed; right: 22px; bottom: 22px; }
+  #lr-bubble-wrap #lr-bubble { position: static; }
   #lr-bubble:hover { transform: scale(1.06); box-shadow: 0 14px 28px -6px ${color}80, 0 2px 8px rgba(0,0,0,0.18); }
   #lr-bubble:active { transform: scale(.97); }
 
@@ -210,8 +213,13 @@ export class WidgetUI {
   #lr-close { background: rgba(255,255,255,0.14); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%;
     cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background .15s ease; }
   #lr-close:hover { background: rgba(255,255,255,0.26); }
-  #lr-status { display: none; align-items: center; gap: 6px; padding: 6px 16px 9px; font-size: 11px; color: #fff; }
+  #lr-status { display: none; align-items: center; gap: 6px; padding: 6px 16px 12px; font-size: 11px; color: #fff; margin-bottom: -1px; }
   #lr-status-dot { width: 7px; height: 7px; border-radius: 50%; background: #4ade80; animation: lr-pulse 1.8s infinite ease-in-out; }
+  #lr-wave { display: none; width: 100%; height: 14px; margin-top: -1px; flex-shrink: 0; }
+
+  #lr-badge { position: absolute; top: -2px; right: -2px; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px;
+    background: #ef4444; color: #fff; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+    border: 2px solid #fff; }
 
   #lr-messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; background: #f8f9fb; }
   #lr-messages::-webkit-scrollbar { width: 6px; }
@@ -237,9 +245,11 @@ export class WidgetUI {
   #lr-send:hover:not(:disabled) { transform: scale(1.06); }
   #lr-send:disabled, #lr-input:disabled { opacity: .55; cursor: default; }
 
-  /* ══════════════════ Modern — gradient header, live-status bar, soft bubbles ══════════════════ */
+  /* ══════════════════ Modern — gradient header, wave transition, live-status, soft bubbles ══════════════════ */
   #lr-panel[data-template="modern"] #lr-header { background: linear-gradient(135deg, ${color}, ${colorDark}); padding-bottom: 8px; }
+  #lr-panel[data-template="modern"] #lr-avatar { width: 40px; height: 40px; box-shadow: 0 0 0 2px rgba(255,255,255,0.4); }
   #lr-panel[data-template="modern"] #lr-status { display: flex; background: linear-gradient(135deg, ${color}, ${colorDark}); }
+  #lr-panel[data-template="modern"] #lr-wave { display: block; }
   #lr-panel[data-template="modern"] .lr-msg-assistant { border-radius: 4px 16px 16px 16px; box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
   #lr-panel[data-template="modern"] .lr-msg-user { background: ${color}; border-radius: 16px 4px 16px 16px; }
 
@@ -275,14 +285,24 @@ export class WidgetUI {
   #lr-panel[data-template="dark"] .lr-msg-user { background: #1a1f2e; border-radius: 12px 4px 12px 12px; }
   #lr-panel[data-template="dark"] #lr-inputbar { background: #fff; border-top-color: #e4e6ea; }
   #lr-panel[data-template="dark"] #lr-send { background: ${color}; }
-  .lr-actions { display: flex; flex-direction: column; gap: 6px; width: 100%; animation: lr-fade-in .2s ease; }
+  /* Same list as Chips' pills, rendered as a vertical stacked menu instead —
+   * first item filled/primary, the rest outlined/secondary, matching the
+   * HappyFox-style "one primary action + secondary options" pattern. */
+  .lr-actions { display: flex; flex-direction: column; gap: 7px; width: 100%; animation: lr-fade-in .2s ease; }
   .lr-action { display: flex; align-items: center; justify-content: space-between; width: 100%; text-align: left;
-    background: #fff; border: 1px solid #e4e6ea; color: #1e2430; font-size: 13px; font-weight: 500;
-    padding: 10px 13px; border-radius: 10px; cursor: pointer; transition: border-color .15s ease, background .15s ease; }
-  .lr-action:hover { border-color: ${color}; background: ${color}0d; }
-  .lr-action svg { flex-shrink: 0; color: ${color}; margin-left: 8px; }
+    background: #fff; border: 1.5px solid ${color}; color: ${color}; font-size: 13px; font-weight: 600;
+    padding: 10px 14px; border-radius: 999px; cursor: pointer; transition: background .15s ease, color .15s ease; }
+  .lr-action:hover { background: ${color}; color: #fff; }
+  .lr-action:hover svg { color: #fff; }
+  .lr-action svg { flex-shrink: 0; color: ${color}; margin-left: 8px; transition: color .15s ease; }
+  .lr-action:first-child { background: ${color}; color: #fff; }
+  .lr-action:first-child svg { color: #fff; }
+  .lr-action:first-child:hover { background: ${colorDark}; }
 </style>
-<button id="lr-bubble" data-template="${template}" aria-label="Open chat">${ICON_CHAT}</button>
+<div id="lr-bubble-wrap">
+  <button id="lr-bubble" data-template="${template}" aria-label="Open chat">${ICON_CHAT}</button>
+  <span id="lr-badge">1</span>
+</div>
 <div id="lr-panel" data-template="${template}">
   <div id="lr-header">
     <div id="lr-avatar">${avatar}</div>
@@ -293,6 +313,7 @@ export class WidgetUI {
     <button id="lr-close" aria-label="Close chat">${ICON_CLOSE}</button>
   </div>
   <div id="lr-status"><span id="lr-status-dot"></span>We're online</div>
+  <svg id="lr-wave" viewBox="0 0 336 14" preserveAspectRatio="none"><path d="M0,0 C56,14 112,14 168,7 C224,0 280,0 336,7 L336,14 L0,14 Z" fill="#f8f9fb"/></svg>
   <div id="lr-messages"></div>
   <div id="lr-inputbar">
     <input id="lr-input" type="text" placeholder="Type a message..." autocomplete="off" />
