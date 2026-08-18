@@ -1,3 +1,5 @@
+import type { VoiceCallState } from './voice/types';
+
 export interface WidgetConfig {
   companyName: string;
   agentName: string;
@@ -5,7 +7,35 @@ export interface WidgetConfig {
   primaryColor: string;
   greeting: string;
   template?: 'modern' | 'minimal' | 'chips' | 'dark';
+  /** Already ANDed with browser support (isVoiceSupported()) by loader.ts
+   * before this reaches WidgetUI — true here always means "safe to render
+   * the mic button," never just "the tenant turned it on." */
+  voiceEnabled?: boolean;
+  voiceAutoPlay?: boolean;
+  /** Continuous, hands-free voice conversation (LiveKit) — a separate
+   * capability from voiceEnabled (push-to-talk) above; shown INSTEAD of the
+   * push-to-talk mic button when on, never both at once. */
+  continuousVoiceEnabled?: boolean;
+  /** Whether the text input stays usable while a continuous voice call is
+   * active — tenant-configurable (Tenant.widget.voice.allowTextDuringVoice),
+   * defaults true (hybrid mode) unless the tenant explicitly turns it off. */
+  allowTextDuringVoice?: boolean;
 }
+
+export type VoiceUiState = 'idle' | 'recording' | 'uploading' | 'thinking' | 'speaking';
+
+const CALL_ACTIVE_STATES: VoiceCallState[] = [
+  'connecting', 'connected', 'listening', 'thinking', 'ai_speaking', 'reconnecting', 'disconnecting',
+];
+const CALL_STATE_LABELS: Partial<Record<VoiceCallState, string>> = {
+  connecting: 'Connecting…',
+  connected: 'Connected',
+  listening: 'Listening…',
+  thinking: 'Thinking…',
+  ai_speaking: 'AI is speaking…',
+  reconnecting: 'Reconnecting…',
+  disconnecting: 'Ending call…',
+};
 
 function escapeHtml(s: string): string {
   const div = document.createElement('div');
@@ -31,6 +61,11 @@ const ICON_CHAT = '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" s
 const ICON_CLOSE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
 const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>';
 const ICON_CHEVRON = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>';
+const ICON_MIC = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>';
+const ICON_STOP = '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+const ICON_SPEAKER = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>';
+const ICON_PHONE = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>';
+const ICON_PHONE_OFF = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="3"/></svg>';
 
 // A small, generic set of quick-reply suggestions — deliberately
 // business-type-agnostic (no industry-specific wording), since this same
@@ -49,14 +84,26 @@ export class WidgetUI {
   private messagesEl: HTMLElement;
   private inputEl: HTMLInputElement;
   private sendBtn: HTMLButtonElement;
+  private micEl: HTMLButtonElement | null = null;
+  private liveEl: HTMLButtonElement | null = null;
   private panelEl: HTMLElement;
   private bubbleEl: HTMLElement;
   private open = false;
   private onSend: (message: string) => void;
   private typingEl: HTMLElement | null = null;
+  /** In-progress live-transcript bubbles, keyed by LiveKit segment id — an
+   * id's bubble is updated in place on every non-final segment (the text
+   * visibly filling in as the visitor/AI speaks) and removed from this map
+   * once its final segment arrives, so a later, different id starts fresh. */
+  private liveMessages = new Map<string, HTMLElement>();
+  private allowTextDuringVoice = true;
 
-  constructor(config: WidgetConfig, onSend: (message: string) => void) {
+  constructor(
+    config: WidgetConfig, onSend: (message: string) => void, onMicClick?: () => void,
+    onLiveToggle?: () => void,
+  ) {
     this.onSend = onSend;
+    this.allowTextDuringVoice = config.allowTextDuringVoice !== false;
     const host = document.createElement('div');
     host.id = 'leadryze-widget-host';
     // `all: initial` isolates this host element's own box from the host
@@ -81,6 +128,14 @@ export class WidgetUI {
     this.inputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') this.handleSend();
     });
+
+    if (config.continuousVoiceEnabled && onLiveToggle) {
+      this.liveEl = this.shadow.getElementById('lr-live') as HTMLButtonElement;
+      this.liveEl?.addEventListener('click', () => onLiveToggle());
+    } else if (config.voiceEnabled && onMicClick) {
+      this.micEl = this.shadow.getElementById('lr-mic') as HTMLButtonElement;
+      this.micEl?.addEventListener('click', () => onMicClick());
+    }
 
     if (config.greeting) this.addMessage('assistant', config.greeting);
 
@@ -152,6 +207,7 @@ export class WidgetUI {
   setBusy(busy: boolean): void {
     this.sendBtn.disabled = busy;
     this.inputEl.disabled = busy;
+    if (this.micEl) this.micEl.disabled = busy;
     if (busy) {
       const div = document.createElement('div');
       div.className = 'lr-msg lr-msg-assistant lr-typing';
@@ -163,6 +219,83 @@ export class WidgetUI {
       this.typingEl?.remove();
       this.typingEl = null;
     }
+  }
+
+  /** Updates the mic button's icon/pulse to reflect where a voice turn
+   * currently is — text input stays disabled for the whole non-idle window
+   * so a visitor can't start two conversational turns at once. */
+  setVoiceState(state: VoiceUiState): void {
+    if (!this.micEl) return;
+    this.micEl.dataset.voiceState = state;
+    this.micEl.innerHTML = state === 'recording' ? ICON_STOP : ICON_MIC;
+    const busy = state !== 'idle';
+    this.sendBtn.disabled = busy;
+    this.inputEl.disabled = busy;
+  }
+
+  /** The single place that derives every visible piece of continuous-call UI
+   * (phone icon, #lr-status text, whether text input is enabled) from one
+   * authoritative VoiceCallState — replaces the old setLiveActive(boolean),
+   * which only ever toggled two states and always disabled text input
+   * unconditionally. `message`, when present, is shown as a normal inline
+   * assistant bubble (used for connection-lost/mic-error notices — the
+   * phone button's own idle state IS the "try again" affordance, and the
+   * text input's own enabled-ness IS "continue with text," so neither needs
+   * a bespoke button). */
+  setCallState(state: VoiceCallState, message?: string): void {
+    if (this.liveEl) {
+      const active = CALL_ACTIVE_STATES.includes(state);
+      this.liveEl.dataset.liveState = active ? 'active' : 'idle';
+      this.liveEl.innerHTML = active ? ICON_PHONE_OFF : ICON_PHONE;
+      this.liveEl.setAttribute('aria-label', active ? 'End voice conversation' : 'Start voice conversation');
+      const disableTextInput = active && !this.allowTextDuringVoice;
+      this.inputEl.disabled = disableTextInput;
+      this.sendBtn.disabled = disableTextInput;
+    }
+    const statusTextEl = this.shadow.getElementById('lr-status-text');
+    if (statusTextEl) statusTextEl.textContent = CALL_STATE_LABELS[state] ?? "We're online";
+    if (message) this.addMessage('assistant', message);
+  }
+
+  /** Live-updating transcript bubble — creates one on first sight of `id`,
+   * updates its text in place on every subsequent call with the same `id`
+   * (a non-final segment), and stops tracking it once `final` is true so a
+   * later, different id starts a fresh bubble. This is what makes the
+   * transcript feel "live" rather than one bubble appearing only once an
+   * utterance completes. */
+  upsertMessage(id: string, role: 'user' | 'assistant', text: string, final: boolean): void {
+    if (role === 'assistant' && this.typingEl) {
+      this.typingEl.remove();
+      this.typingEl = null;
+    }
+    let el = this.liveMessages.get(id);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = `lr-msg lr-msg-${role}`;
+      this.messagesEl.appendChild(el);
+    }
+    el.textContent = text;
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+    if (final) this.liveMessages.delete(id);
+    else this.liveMessages.set(id, el);
+  }
+
+  /** iOS Safari blocks autoplay not triggered by a direct tap — when
+   * player.play() reports it was blocked, this appends a small inline button
+   * next to the just-added assistant reply so the visitor can tap to hear it
+   * instead of the reply silently never playing. */
+  addPlayFallback(onClick: () => void): void {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'lr-play-fallback';
+    btn.innerHTML = `${ICON_SPEAKER} Tap to hear reply`;
+    btn.addEventListener('click', () => onClick());
+    this.messagesEl.appendChild(btn);
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+
+  getShadowRoot(): ShadowRoot {
+    return this.shadow;
   }
 
   private renderShell(config: WidgetConfig, template: string): string {
@@ -245,6 +378,23 @@ export class WidgetUI {
   #lr-send:hover:not(:disabled) { transform: scale(1.06); }
   #lr-send:disabled, #lr-input:disabled { opacity: .55; cursor: default; }
 
+  #lr-mic { border: 1.5px solid ${color}; color: ${color}; background: #fff; border-radius: 50%; width: 36px; height: 36px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform .1s ease, background .15s ease, color .15s ease; }
+  #lr-mic:hover:not(:disabled) { transform: scale(1.06); }
+  #lr-mic:disabled { opacity: .55; cursor: default; }
+  #lr-mic[data-voice-state="recording"] { background: #ef4444; border-color: #ef4444; color: #fff; animation: lr-pulse 1.1s infinite ease-in-out; }
+  #lr-mic[data-voice-state="uploading"], #lr-mic[data-voice-state="thinking"], #lr-mic[data-voice-state="speaking"] { opacity: .7; }
+
+  #lr-live { border: 1.5px solid ${color}; color: ${color}; background: #fff; border-radius: 50%; width: 36px; height: 36px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform .1s ease, background .15s ease, color .15s ease; }
+  #lr-live:hover { transform: scale(1.06); }
+  #lr-live[data-live-state="active"] { background: #ef4444; border-color: #ef4444; color: #fff; animation: lr-pulse 1.4s infinite ease-in-out; }
+
+  .lr-play-fallback { display: flex; align-items: center; gap: 6px; align-self: flex-start; background: #fff;
+    border: 1.5px solid ${color}; color: ${color}; font-size: 12px; font-weight: 600; padding: 6px 12px;
+    border-radius: 999px; cursor: pointer; transition: background .15s ease, color .15s ease; animation: lr-fade-in .18s ease; }
+  .lr-play-fallback:hover { background: ${color}; color: #fff; }
+
   /* ══════════════════ Modern — gradient header, wave transition, live-status, soft bubbles ══════════════════ */
   #lr-panel[data-template="modern"] #lr-header { background: linear-gradient(135deg, ${color}, ${colorDark}); padding-bottom: 8px; }
   #lr-panel[data-template="modern"] #lr-avatar { width: 40px; height: 40px; box-shadow: 0 0 0 2px rgba(255,255,255,0.4); }
@@ -312,11 +462,16 @@ export class WidgetUI {
     </div>
     <button id="lr-close" aria-label="Close chat">${ICON_CLOSE}</button>
   </div>
-  <div id="lr-status"><span id="lr-status-dot"></span>We're online</div>
+  <div id="lr-status"><span id="lr-status-dot"></span><span id="lr-status-text">We're online</span></div>
   <svg id="lr-wave" viewBox="0 0 336 14" preserveAspectRatio="none"><path d="M0,0 C56,14 112,14 168,7 C224,0 280,0 336,7 L336,14 L0,14 Z" fill="#f8f9fb"/></svg>
   <div id="lr-messages"></div>
   <div id="lr-inputbar">
     <input id="lr-input" type="text" placeholder="Type a message..." autocomplete="off" />
+    ${config.continuousVoiceEnabled
+      ? `<button id="lr-live" type="button" aria-label="Start voice conversation" data-live-state="idle">${ICON_PHONE}</button>`
+      : config.voiceEnabled
+        ? `<button id="lr-mic" type="button" aria-label="Record voice message" data-voice-state="idle">${ICON_MIC}</button>`
+        : ''}
     <button id="lr-send" aria-label="Send">${ICON_SEND}</button>
   </div>
 </div>`;
