@@ -1,6 +1,6 @@
 import { API_BASE_URL } from './config';
 import { getVisitorId, getSessionId } from './storage';
-import { WidgetUI, WidgetConfig } from './ui';
+import { WidgetUI, WidgetConfig, DatasetItemCard } from './ui';
 import { isVoiceSupported, VoiceRecorder } from './voice/recorder';
 import { sendVoiceChat } from './voice/voice-api';
 import { VoicePlayer } from './voice/player';
@@ -69,7 +69,13 @@ async function fetchHistory(
   }
 }
 
-async function sendChat(apiBaseUrl: string, widgetKey: string, sessionId: string, visitorId: string, message: string): Promise<string> {
+interface ChatReply {
+  response: string;
+  items?: DatasetItemCard[];
+  totalMatches?: number;
+}
+
+async function sendChat(apiBaseUrl: string, widgetKey: string, sessionId: string, visitorId: string, message: string): Promise<ChatReply> {
   try {
     const res = await fetch(`${apiBaseUrl}/public/widget/chat?widgetKey=${encodeURIComponent(widgetKey)}`, {
       method: 'POST',
@@ -78,11 +84,15 @@ async function sendChat(apiBaseUrl: string, widgetKey: string, sessionId: string
     });
     const body = await res.json();
     if (!res.ok || !body.success) {
-      return body.message || "Sorry, I'm having trouble responding right now.";
+      return { response: body.message || "Sorry, I'm having trouble responding right now." };
     }
-    return body.data?.response ?? "Sorry, I didn't catch that.";
+    return {
+      response: body.data?.response ?? "Sorry, I didn't catch that.",
+      items: body.data?.items,
+      totalMatches: body.data?.totalMatches,
+    };
   } catch {
-    return "Sorry, I'm having trouble connecting right now. Please try again shortly.";
+    return { response: "Sorry, I'm having trouble connecting right now. Please try again shortly." };
   }
 }
 
@@ -130,7 +140,7 @@ async function init(): Promise<void> {
     async (message) => {
       ui.setBusy(true);
       const reply = await sendChat(apiBaseUrl, widgetKey, sessionId, visitorId, message);
-      ui.addMessage('assistant', reply);
+      ui.addMessage('assistant', reply.response, reply.items, reply.totalMatches, message);
       ui.setBusy(false);
     },
     config.voiceEnabled ? () => { void handleMicClick(); } : undefined,

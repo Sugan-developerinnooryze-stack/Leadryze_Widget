@@ -20,6 +20,25 @@ export interface WidgetConfig {
    * active — tenant-configurable (Tenant.widget.voice.allowTextDuringVoice),
    * defaults true (hybrid mode) unless the tenant explicitly turns it off. */
   allowTextDuringVoice?: boolean;
+  /** Tenant-authored suggestion chips (Quick Questions) — already filtered
+   * to enabled-only, plain strings, by the backend's getConfig() projection.
+   * Falls back to QUICK_SUGGESTIONS below when unset, so existing tenants
+   * who never configured any don't regress to an empty chip row. */
+  quickQuestions?: string[];
+}
+
+/** Mirrors the AI-side shape (ai/src/agents/dataset-item-card.types.ts) —
+ * built exclusively from a real search_dataset tool result on the backend,
+ * never from the LLM's own generated text, so a "Request Quote" click
+ * always traces back to a genuine record. */
+export interface DatasetItemCard {
+  datasetId: string;
+  datasetName: string;
+  recordId: string;
+  title: string;
+  price?: string;
+  imageUrl?: string;
+  keySpecs?: string[];
 }
 
 export type VoiceUiState = 'idle' | 'recording' | 'uploading' | 'thinking' | 'speaking';
@@ -41,6 +60,21 @@ function escapeHtml(s: string): string {
   const div = document.createElement('div');
   div.textContent = s;
   return div.innerHTML;
+}
+
+/** Only http(s):// is ever treated as a real image — defense in depth
+ * alongside the same check already applied server-side (search-dataset.tool.ts's
+ * isSafeImageUrl). Rejects javascript:/data:/file:/anything else, and any
+ * value that fails to parse as a URL at all. Assigned directly to img.src
+ * as a validated string, never built via string concatenation. */
+function isSafeImageUrl(value: string | undefined): value is string {
+  if (!value) return false;
+  try {
+    const u = new URL(value);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 /** Darkens/lightens a #rrggbb hex color by `amount` (-1..1) — used to derive
@@ -97,6 +131,7 @@ export class WidgetUI {
    * once its final segment arrives, so a later, different id starts fresh. */
   private liveMessages = new Map<string, HTMLElement>();
   private allowTextDuringVoice = true;
+  private quickQuestions: string[];
 
   constructor(
     config: WidgetConfig, onSend: (message: string) => void, onMicClick?: () => void,
@@ -104,6 +139,7 @@ export class WidgetUI {
   ) {
     this.onSend = onSend;
     this.allowTextDuringVoice = config.allowTextDuringVoice !== false;
+    this.quickQuestions = config.quickQuestions?.length ? config.quickQuestions : QUICK_SUGGESTIONS;
     const host = document.createElement('div');
     host.id = 'leadryze-widget-host';
     // `all: initial` isolates this host element's own box from the host
@@ -139,8 +175,17 @@ export class WidgetUI {
 
     if (config.greeting) this.addMessage('assistant', config.greeting);
 
-    if (template === 'chips') this.renderQuickReplies('lr-chips', 'lr-chip');
+    // Real gap fixed here: quick-question chips were only ever wired up for
+    // the 'chips'/'dark' templates, so a tenant on 'modern' or 'minimal'
+    // (modern is every new tenant's default) had their configured Quick
+    // Questions silently never render at all — confirmed live against a
+    // real tenant with 6 correctly-saved, enabled questions that never
+    // appeared in the widget. The .lr-chips/.lr-chip CSS below was never
+    // template-scoped to begin with (only .lr-actions/.lr-action's dark
+    // vertical-menu style is template-specific), so every other template
+    // now gets the same horizontal pill chips 'chips' already had.
     if (template === 'dark') this.renderQuickReplies('lr-actions', 'lr-action');
+    else this.renderQuickReplies('lr-chips', 'lr-chip');
   }
 
   /** Same suggestion list, rendered as either horizontal pills (chips
@@ -149,7 +194,7 @@ export class WidgetUI {
   private renderQuickReplies(wrapClass: string, itemClass: string): void {
     const wrap = document.createElement('div');
     wrap.className = wrapClass;
-    for (const label of QUICK_SUGGESTIONS) {
+    for (const label of this.quickQuestions) {
       const btn = document.createElement('button');
       btn.className = itemClass;
       btn.type = 'button';
@@ -162,6 +207,105 @@ export class WidgetUI {
     }
     this.messagesEl.appendChild(wrap);
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+
+  /** One shared card style across all 4 templates (reusing the tenant's own
+   * color tokens via CSS, not 4 bespoke designs) — built entirely with
+   * createElement/.textContent, never innerHTML with tenant/dataset-sourced
+   * text, matching this file's existing XSS posture. Appended as a distinct
+   * element after the assistant's text bubble, same structural pattern
+   * renderQuickReplies() already uses. */
+  private renderItemCards(items: DatasetItemCard[], totalMatches: number | undefined, sourceQuestion: string | undefined): void {
+    const wrap = document.createElement('div');
+    wrap.className = 'lr-cards';
+
+    for (const item of items) {
+      const card = document.createElement('div');
+      card.className = 'lr-card';
+
+      if (isSafeImageUrl(item.imageUrl)) {
+        const img = document.createElement('img');
+        img.className = 'lr-card-img';
+        img.loading = 'lazy';
+        img.alt = item.title;
+        img.onerror = () => { img.replaceWith(this.buildCardImagePlaceholder()); };
+        img.src = item.imageUrl as string;
+        card.appendChild(img);
+      } else {
+        card.appendChild(this.buildCardImagePlaceholder());
+      }
+
+      const body = document.createElement('div');
+      body.className = 'lr-card-body';
+
+      const title = document.createElement('div');
+      title.className = 'lr-card-title';
+      title.textContent = item.title;
+      body.appendChild(title);
+
+      if (item.price) {
+        const price = document.createElement('div');
+        price.className = 'lr-card-price';
+        price.textContent = item.price;
+        body.appendChild(price);
+      }
+
+      if (item.keySpecs?.length) {
+        const specs = document.createElement('div');
+        specs.className = 'lr-card-specs';
+        for (const spec of item.keySpecs) {
+          const line = document.createElement('div');
+          line.textContent = spec;
+          specs.appendChild(line);
+        }
+        body.appendChild(specs);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'lr-card-actions';
+      const detailsBtn = document.createElement('button');
+      detailsBtn.type = 'button';
+      detailsBtn.className = 'lr-card-btn';
+      detailsBtn.textContent = 'View Details';
+      detailsBtn.addEventListener('click', () => this.sendText(`Tell me more about ${item.title}`));
+      const quoteBtn = document.createElement('button');
+      quoteBtn.type = 'button';
+      quoteBtn.className = 'lr-card-btn lr-card-btn-primary';
+      quoteBtn.textContent = 'Request Quote';
+      quoteBtn.addEventListener('click', () => this.sendText(`I'd like a quote for ${item.title}`));
+      actions.appendChild(detailsBtn);
+      actions.appendChild(quoteBtn);
+      body.appendChild(actions);
+
+      card.appendChild(body);
+      wrap.appendChild(card);
+    }
+
+    this.messagesEl.appendChild(wrap);
+
+    // "Show more" — only when the query genuinely matched more than what's
+    // shown; never implies these items are the complete result set
+    // otherwise. Just another normal chat turn, no pagination state kept.
+    if (typeof totalMatches === 'number' && totalMatches > items.length && sourceQuestion) {
+      const more = document.createElement('div');
+      more.className = 'lr-cards-more';
+      const note = document.createElement('span');
+      note.textContent = `Showing ${items.length} of ${totalMatches} matches. `;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'lr-card-btn';
+      btn.textContent = 'Show more';
+      btn.addEventListener('click', () => this.sendText(`Show more ${sourceQuestion}`));
+      more.appendChild(note);
+      more.appendChild(btn);
+      this.messagesEl.appendChild(more);
+    }
+  }
+
+  private buildCardImagePlaceholder(): HTMLElement {
+    const div = document.createElement('div');
+    div.className = 'lr-card-img lr-card-img-placeholder';
+    return div;
   }
 
   private handleSend(): void {
@@ -190,7 +334,7 @@ export class WidgetUI {
     }
   }
 
-  addMessage(role: 'user' | 'assistant', text: string): void {
+  addMessage(role: 'user' | 'assistant', text: string, items?: DatasetItemCard[], totalMatches?: number, sourceQuestion?: string): void {
     // A reply arriving removes the typing indicator right as it's replaced
     // by the real message, rather than leaving it to linger until setBusy(false).
     if (role === 'assistant' && this.typingEl) {
@@ -201,6 +345,7 @@ export class WidgetUI {
     div.className = `lr-msg lr-msg-${role}`;
     div.textContent = text;
     this.messagesEl.appendChild(div);
+    if (role === 'assistant' && items?.length) this.renderItemCards(items, totalMatches, sourceQuestion);
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
 
@@ -394,6 +539,27 @@ export class WidgetUI {
     border: 1.5px solid ${color}; color: ${color}; font-size: 12px; font-weight: 600; padding: 6px 12px;
     border-radius: 999px; cursor: pointer; transition: background .15s ease, color .15s ease; animation: lr-fade-in .18s ease; }
   .lr-play-fallback:hover { background: ${color}; color: #fff; }
+
+  /* ══════ Item / product cards — one shared style across all 4 templates, ══════
+   * using the tenant's own color tokens rather than per-template bespoke designs. */
+  .lr-cards { display: flex; flex-direction: column; gap: 8px; align-self: stretch; animation: lr-fade-in .2s ease; }
+  .lr-card { display: flex; gap: 10px; background: #fff; border: 1px solid #e8eaee; border-radius: 10px;
+    padding: 10px; box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .lr-card-img { width: 64px; height: 64px; flex-shrink: 0; border-radius: 8px; object-fit: cover; background: #f1f2f5; }
+  .lr-card-img-placeholder { display: flex; align-items: center; justify-content: center; background:
+    linear-gradient(135deg, #eef0f4, #e4e7ec); }
+  .lr-card-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .lr-card-title { font-size: 13.5px; font-weight: 700; color: #1e2430; line-height: 1.3; }
+  .lr-card-price { font-size: 13px; font-weight: 600; color: ${color}; }
+  .lr-card-specs { font-size: 11.5px; color: #6b7280; line-height: 1.4; }
+  .lr-card-actions { display: flex; gap: 6px; margin-top: 4px; }
+  .lr-card-btn { flex: 1; border: 1.5px solid ${color}; background: #fff; color: ${color}; font-size: 11.5px;
+    font-weight: 600; padding: 6px 8px; border-radius: 999px; cursor: pointer; transition: background .15s ease, color .15s ease; }
+  .lr-card-btn:hover { background: ${color}; color: #fff; }
+  .lr-card-btn-primary { background: ${color}; color: #fff; }
+  .lr-card-btn-primary:hover { background: ${colorDark}; }
+  .lr-cards-more { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #6b7280; align-self: stretch; }
+  .lr-cards-more .lr-card-btn { flex: 0 0 auto; padding: 6px 14px; }
 
   /* ══════════════════ Modern — gradient header, wave transition, live-status, soft bubbles ══════════════════ */
   #lr-panel[data-template="modern"] #lr-header { background: linear-gradient(135deg, ${color}, ${colorDark}); padding-bottom: 8px; }
