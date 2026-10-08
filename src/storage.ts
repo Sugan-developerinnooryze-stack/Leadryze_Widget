@@ -38,3 +38,51 @@ export function getSessionId(): string {
     return uuid();
   }
 }
+
+/** "Start a new conversation" — mints and persists a fresh sessionId,
+ * overwriting the current one. The old ChatSession document is untouched
+ * (still readable in admin history by its old sessionId); this just stops
+ * the widget from appending to it going forward. visitorId (the durable
+ * localStorage identity) is deliberately untouched by this. */
+export function resetSessionId(): string {
+  const id = uuid();
+  try { sessionStorage.setItem(SESSION_KEY, id); } catch { /* private browsing */ }
+  return id;
+}
+
+/** The short-lived (~2h) Human Handoff widget socket token — sessionStorage,
+ * same lifetime posture as sessionId itself (dies with the tab, survives an
+ * in-page reload), which is exactly the token's own natural scope: it's
+ * minted FOR this one sessionId and is useless once that session ends.
+ * Stored alongside the sessionId it was minted for so a reload never reuses
+ * a token that belonged to a different (expired/replaced) session. */
+const HANDOFF_TOKEN_KEY = '__leadryze_handoff_token';
+const HANDOFF_TOKEN_SESSION_KEY = '__leadryze_handoff_token_session';
+
+export function getHandoffToken(sessionId: string): string | null {
+  try {
+    if (sessionStorage.getItem(HANDOFF_TOKEN_SESSION_KEY) !== sessionId) return null;
+    return sessionStorage.getItem(HANDOFF_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setHandoffToken(sessionId: string, token: string): void {
+  try {
+    sessionStorage.setItem(HANDOFF_TOKEN_SESSION_KEY, sessionId);
+    sessionStorage.setItem(HANDOFF_TOKEN_KEY, token);
+  } catch {
+    // Private browsing / storage blocked — the socket simply won't survive
+    // a reload mid-handoff; text chat (gated server-side) still works.
+  }
+}
+
+export function clearHandoffToken(): void {
+  try {
+    sessionStorage.removeItem(HANDOFF_TOKEN_KEY);
+    sessionStorage.removeItem(HANDOFF_TOKEN_SESSION_KEY);
+  } catch {
+    // no-op
+  }
+}

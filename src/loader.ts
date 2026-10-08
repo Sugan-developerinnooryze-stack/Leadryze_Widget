@@ -1,6 +1,7 @@
+import { io as ioClient, Socket } from 'socket.io-client';
 import { API_BASE_URL } from './config';
-import { getVisitorId, getSessionId } from './storage';
-import { WidgetUI, WidgetConfig, DatasetItemCard } from './ui';
+import { getVisitorId, getSessionId, resetSessionId, getHandoffToken, setHandoffToken, clearHandoffToken } from './storage';
+import { WidgetUI, WidgetConfig, DatasetItemCard, HandoffUiState } from './ui';
 import { isVoiceSupported, VoiceRecorder } from './voice/recorder';
 import { sendVoiceChat } from './voice/voice-api';
 import { VoicePlayer } from './voice/player';
@@ -46,7 +47,7 @@ async function fetchConfig(widgetKey: string, apiBaseUrl: string): Promise<Widge
   }
 }
 
-interface HistoryMessage { role: 'user' | 'assistant'; content: string; timestamp: string; channel: string; }
+interface HistoryMessage { role: 'user' | 'assistant' | 'staff' | 'system'; content: string; timestamp: string; channel: string; }
 
 /** Rehydrates the full conversation (text + push-to-talk + continuous voice,
  * all interleaved in the same shared timeline) across a widget reload —
@@ -73,6 +74,11 @@ interface ChatReply {
   response: string;
   items?: DatasetItemCard[];
   totalMatches?: number;
+  /** True while this session is handed off to a human — set by the backend's
+   * AI-pause gate (public-widget.controller.ts's postChat()). `response` is
+   * always empty in that case; the real reply, if any, arrives over the
+   * handoff socket instead, not in this HTTP response. */
+  humanMode?: boolean;
 }
 
 async function sendChat(apiBaseUrl: string, widgetKey: string, sessionId: string, visitorId: string, message: string): Promise<ChatReply> {
@@ -90,9 +96,55 @@ async function sendChat(apiBaseUrl: string, widgetKey: string, sessionId: string
       response: body.data?.response ?? "Sorry, I didn't catch that.",
       items: body.data?.items,
       totalMatches: body.data?.totalMatches,
+      humanMode: body.data?.humanMode,
     };
   } catch {
     return { response: "Sorry, I'm having trouble connecting right now. Please try again shortly." };
+  }
+}
+
+interface HandoffRequestResult { status: string; widgetToken: string; waitingMessage: string; }
+
+/** Visitor clicks "Connect with an expert" — mints the short-lived widget
+ * socket token server-side (see public-widget.controller.ts's
+ * postHandoffRequest). Returns null on any failure (feature off, network
+ * error, tenant misconfigured) — callers must degrade to "button stays
+ * idle, nothing changes," never a half-started handoff. */
+async function requestHandoff(
+  apiBaseUrl: string, widgetKey: string, sessionId: string, visitorId: string,
+): Promise<HandoffRequestResult | null> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/public/widget/handoff/request?widgetKey=${encodeURIComponent(widgetKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, visitorId, pageUrl: location.href }),
+    });
+    const body = await res.json();
+    if (!res.ok || !body.success) return null;
+    return body.data as HandoffRequestResult;
+  } catch {
+    return null;
+  }
+}
+
+interface HandoffState { mode: 'ai' | 'human'; handoffStatus: 'none' | 'waiting' | 'claimed'; assignedToName?: string; }
+
+/** One-time catch-up check on widget open — NOT polled. Only ever called
+ * when the tenant has the feature on, so an ordinary tenant pays zero extra
+ * requests. Lets a visitor who reloads the page mid-handoff see the correct
+ * bar state immediately, instead of it silently resetting to idle. */
+async function fetchHandoffState(
+  apiBaseUrl: string, widgetKey: string, sessionId: string, visitorId: string,
+): Promise<HandoffState | null> {
+  try {
+    const url = `${apiBaseUrl}/public/widget/handoff/history?widgetKey=${encodeURIComponent(widgetKey)}` +
+      `&sessionId=${encodeURIComponent(sessionId)}&visitorId=${encodeURIComponent(visitorId)}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body.data as HandoffState;
+  } catch {
+    return null;
   }
 }
 
@@ -111,7 +163,16 @@ async function init(): Promise<void> {
   }
 
   const visitorId = getVisitorId();
-  const sessionId = getSessionId();
+  // Reassigned by the header's "start a new conversation" reset button
+  // (see handleReset below) — every closure that reads `sessionId` below
+  // does so at call time, not at definition time, so a reset correctly
+  // takes effect for every subsequent send/claim/etc. without needing to
+  // re-run init() or reconstruct the UI.
+  let sessionId = getSessionId();
+  // Captured before config.greeting is ever conditionally blanked out below
+  // — resetConversation() always wants the tenant's real configured
+  // greeting, never whatever history happened to suppress it to on load.
+  const originalGreeting = config.greeting;
 
   // Feature-detected here, not just left to the tenant's own toggle — an
   // unsupported browser never sees a mic button at all, per ui.ts's own
@@ -130,6 +191,14 @@ async function init(): Promise<void> {
   const history = await fetchHistory(apiBaseUrl, widgetKey, sessionId, visitorId);
   if (history.length > 0) config.greeting = '';
 
+  // Backward-compat gate per ui.ts's own contract: an absent/falsy value
+  // must behave as OFF, never "on by default." Only checked here — and only
+  // ever fetches the extra handoff-state endpoint — when explicitly true.
+  const humanHandoffEnabled = config.humanHandoffEnabled === true;
+  const initialHandoffState = humanHandoffEnabled
+    ? await fetchHandoffState(apiBaseUrl, widgetKey, sessionId, visitorId)
+    : null;
+
   let voiceState: VoiceUiState = 'idle';
   const recorder = new VoiceRecorder();
   let player: VoicePlayer | null = null;
@@ -140,14 +209,30 @@ async function init(): Promise<void> {
     async (message) => {
       ui.setBusy(true);
       const reply = await sendChat(apiBaseUrl, widgetKey, sessionId, visitorId, message);
+      if (reply.humanMode) {
+        // The visitor's own bubble was already rendered by sendText() before
+        // onSend fired — the real staff reply, if any, arrives over the
+        // handoff socket, not in this HTTP response. Nothing more to render.
+        ui.setBusy(false);
+        return;
+      }
       ui.addMessage('assistant', reply.response, reply.items, reply.totalMatches, message);
       ui.setBusy(false);
     },
     config.voiceEnabled ? () => { void handleMicClick(); } : undefined,
     config.continuousVoiceEnabled ? () => { void handleLiveToggle(); } : undefined,
+    humanHandoffEnabled ? () => { void handleRequestHuman(); } : undefined,
+    () => handleReset(),
   );
 
-  for (const m of history) ui.addMessage(m.role, m.content);
+  // 'system' messages (join/claim/hand-back audit events) are for the staff
+  // inbox's own thread view, not this widget — a visitor sees the hand-back
+  // moment via its own dedicated addMessage() call below instead. 'staff'
+  // renders visually like any other reply from "the other side."
+  for (const m of history) {
+    if (m.role === 'system') continue;
+    ui.addMessage(m.role === 'staff' ? 'assistant' : m.role, m.content);
+  }
 
   if (config.voiceEnabled) player = new VoicePlayer(ui.getShadowRoot());
 
@@ -155,6 +240,90 @@ async function init(): Promise<void> {
     voiceState = state;
     ui.setVoiceState(state);
   };
+
+  // Human Handoff — the widget's own Socket.IO connection, opened lazily
+  // (only once a handoff actually exists for this visitor), never on every
+  // widget load. Uses the narrowly-scoped widget token minted by
+  // postHandoffRequest — see server.ts's io.use for the matching
+  // verification branch; this socket structurally cannot join any room but
+  // its own session:{id}, even if it tried.
+  let handoffSocket: Socket | null = null;
+
+  const onHandoffClaimed = (payload: { assignedToName?: string }): void => {
+    ui.setHandoffState('claimed', payload.assignedToName);
+  };
+  // Only 'staff'-authored messages are rendered here — the visitor's OWN
+  // messages are already rendered synchronously by sendText() the moment
+  // they're typed; the session room echoes every message to both sides, so
+  // rendering role:'user' here too would duplicate the visitor's own bubble.
+  const onHandoffMessage = (payload: { role: string; content: string }): void => {
+    if (payload.role === 'staff') ui.addMessage('assistant', payload.content);
+  };
+  const onHandoffClosed = (): void => {
+    ui.setHandoffState('idle');
+    ui.addMessage('assistant', "You're back with the AI assistant.");
+    clearHandoffToken();
+    handoffSocket?.disconnect();
+    handoffSocket = null;
+  };
+
+  const connectHandoffSocket = (token: string): void => {
+    handoffSocket?.disconnect();
+    handoffSocket = ioClient(new URL(apiBaseUrl).origin, { auth: { token } });
+    handoffSocket.on('connect', () => handoffSocket?.emit('join-own-session'));
+    // A connection failure here (CORS, expired token, server unreachable)
+    // would otherwise be entirely silent to a visitor and to whoever's
+    // debugging it — logged, not surfaced in the UI, since this is a
+    // best-effort live-push channel and text chat still works via the
+    // normal gated HTTP path regardless.
+    handoffSocket.on('connect_error', (err) => {
+      console.warn('[LeadRyze Widget] Handoff socket connection failed:', err.message);
+    });
+    handoffSocket.on('handoff:claimed', onHandoffClaimed);
+    handoffSocket.on('handoff:message', onHandoffMessage);
+    handoffSocket.on('handoff:closed', onHandoffClosed);
+  };
+
+  const handleRequestHuman = async (): Promise<void> => {
+    ui.setHandoffState('waiting');
+    const result = await requestHandoff(apiBaseUrl, widgetKey, sessionId, visitorId);
+    if (!result) {
+      ui.setHandoffState('idle');
+      ui.addMessage('assistant', "Sorry, we couldn't connect you with a team member right now — please try again shortly.");
+      return;
+    }
+    setHandoffToken(sessionId, result.widgetToken);
+    if (result.waitingMessage) ui.addMessage('assistant', result.waitingMessage);
+    connectHandoffSocket(result.widgetToken);
+  };
+
+  // Header "start a new conversation" button — tears down any live handoff
+  // connection (a fresh session has no active handoff), mints a brand-new
+  // sessionId so subsequent messages land in a NEW ChatSession document
+  // rather than appending to the old one (which is left exactly as-is, not
+  // deleted — still visible in admin history under its own old sessionId),
+  // and resets the visible transcript back to just the greeting.
+  const handleReset = (): void => {
+    handoffSocket?.disconnect();
+    handoffSocket = null;
+    clearHandoffToken();
+    sessionId = resetSessionId();
+    ui.resetConversation(originalGreeting);
+  };
+
+  // Reload/reopen mid-handoff — reflect the correct bar state immediately,
+  // and reconnect the socket if this tab still holds a (un-expired, same-
+  // session) token from when the handoff was originally requested. No
+  // stored token (private browsing, a different tab/device, or the ~2h
+  // token has expired) still leaves the bar in the right state — the
+  // visitor simply won't get live push until they reopen from the tab that
+  // originally requested it; text still reaches staff via the normal gated
+  // chat endpoint either way.
+  if (initialHandoffState?.handoffStatus === 'waiting' || initialHandoffState?.handoffStatus === 'claimed') {
+    ui.setHandoffState(initialHandoffState.handoffStatus as HandoffUiState, initialHandoffState.assignedToName);
+    const storedToken = getHandoffToken(sessionId);
+    if (storedToken) connectHandoffSocket(storedToken);
+  }
 
   // Declared as const arrow expressions (not `function` declarations) so
   // TypeScript's control-flow narrowing of `widgetKey`/`config` (checked
