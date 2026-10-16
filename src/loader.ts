@@ -1,7 +1,7 @@
 import { io as ioClient, Socket } from 'socket.io-client';
 import { API_BASE_URL } from './config';
 import { getVisitorId, getSessionId, resetSessionId, getHandoffToken, setHandoffToken, clearHandoffToken } from './storage';
-import { WidgetUI, WidgetConfig, DatasetItemCard, HandoffUiState } from './ui';
+import { WidgetUI, WidgetConfig, DatasetItemCard, HandoffUiState, ConnectBranchSubmitResult } from './ui';
 import { isVoiceSupported, VoiceRecorder } from './voice/recorder';
 import { sendVoiceChat } from './voice/voice-api';
 import { VoicePlayer } from './voice/player';
@@ -148,6 +148,30 @@ async function fetchHandoffState(
   }
 }
 
+/** Submits the Connect-with-Branch form. Unlike requestHandoff() (which
+ * returns null on any failure), this distinguishes a field-validation 400
+ * from a hard network/server failure, since the form needs to show the
+ * visitor WHICH fields are wrong rather than just a generic error. */
+async function submitConnectBranch(
+  apiBaseUrl: string, widgetKey: string, sessionId: string, visitorId: string,
+  values: Record<string, string>,
+): Promise<ConnectBranchSubmitResult> {
+  try {
+    const res = await fetch(`${apiBaseUrl}/public/widget/connect-branch/submit?widgetKey=${encodeURIComponent(widgetKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, visitorId, pageUrl: location.href, values }),
+    });
+    const body = await res.json();
+    if (!res.ok || !body.success) {
+      return { ok: false, message: body.message, fieldErrors: body.errors?.fieldErrors };
+    }
+    return { ok: true, message: undefined };
+  } catch {
+    return { ok: false, message: "Sorry, we're having trouble connecting right now. Please try again shortly." };
+  }
+}
+
 async function init(): Promise<void> {
   const widgetKey = getWidgetKey();
   if (!widgetKey) {
@@ -199,6 +223,10 @@ async function init(): Promise<void> {
     ? await fetchHandoffState(apiBaseUrl, widgetKey, sessionId, visitorId)
     : null;
 
+  // "Connect with Your Local Branch" — same backward-compat gate pattern as
+  // humanHandoffEnabled above, completely independent of it.
+  const connectBranchEnabled = config.connectBranchEnabled === true;
+
   let voiceState: VoiceUiState = 'idle';
   const recorder = new VoiceRecorder();
   let player: VoicePlayer | null = null;
@@ -223,6 +251,10 @@ async function init(): Promise<void> {
     config.continuousVoiceEnabled ? () => { void handleLiveToggle(); } : undefined,
     humanHandoffEnabled ? () => { void handleRequestHuman(); } : undefined,
     () => handleReset(),
+    connectBranchEnabled ? () => { ui.showConnectBranchForm(); } : undefined,
+    connectBranchEnabled
+      ? (values: Record<string, string>) => submitConnectBranch(apiBaseUrl, widgetKey, sessionId, visitorId, values)
+      : undefined,
   );
 
   // 'system' messages (join/claim/hand-back audit events) are for the staff
